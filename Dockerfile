@@ -1,4 +1,7 @@
-FROM node:20-alpine AS base
+# Mirror público de AWS ECR (espejo de Docker Official Images). Evita el
+# rate-limit de pulls anónimos de Docker Hub (429 toomanyrequests) que rompe
+# los builds en EasyPanel. Pauta: feedback_easypanel_gotchas.
+FROM public.ecr.aws/docker/library/node:20-alpine AS base
 WORKDIR /app
 
 COPY package.json ./
