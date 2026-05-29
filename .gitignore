@@ -1,0 +1,10 @@
+node_modules
+.env
+.env.local
+.env.*.local
+npm-debug.log
+.DS_Store
+*.log
+
+# Documentación interna — no se sube al repo.
+docs/
