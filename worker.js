@@ -479,12 +479,13 @@ async function processPushJob(job) {
         // NO lo soporta → lo aplicamos por variante con PUT /products/{id}/variants/{vid}.
         // Solo para las variantes del batch que traen promotional_price (>0).
         for (const pu of batch) {
-            if (pu.promotional_price === undefined || pu.promotional_price === null) continue;
+            if (pu.promotional_price === undefined) continue;
             const promo = Number(pu.promotional_price);
-            if (!(promo > 0)) continue;
+            // promo > 0 → setear la oferta; promo == 0 → QUITARLA (null en TN).
+            const promoBody = promo > 0 ? promo : null;
             await throttle(lastRate);
             try {
-                const pr = await tnUpdateVariant(account, token, pu.tn_product_id, pu.variant_id, { promotional_price: promo });
+                const pr = await tnUpdateVariant(account, token, pu.tn_product_id, pu.variant_id, { promotional_price: promoBody });
                 lastRate = pr.rate;
                 const rr = results.find((r) => r.variant_id === Number(pu.variant_id));
                 if (!pr.ok) {
