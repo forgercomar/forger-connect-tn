@@ -701,19 +701,16 @@ app.get('/connect-tn', limitOauthStart, async (req, res) => {
         ));
     }
 
-    // Hardening #23: nonce one-use (anti-replay del start).
-    try {
-        const nonceCheck = await checkAndConsumeNonce(String(nonce), 'oauth_start');
-        if (!nonceCheck.ok) {
-            return res.status(409).type('html').send(htmlPage('Error',
-                `<h1 class="err">⚠ Link ya usado</h1>
-                <p>Este link de OAuth ya se usó antes. Volvé al plugin y generá uno nuevo.</p>`
-            ));
-        }
-    } catch (e) {
-        console.error('[connect-tn] nonce check error:', e.message);
-        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error interno</h1>`));
-    }
+    // NOTA (fix 2026-05-30): el START NO consume el nonce como one-use. El plugin
+    // manda un WP nonce (reutilizable dentro de su ventana ~12h), así que
+    // consumirlo acá rompía el reintento legítimo del usuario ("Link ya usado" al
+    // cerrar el popup y volver a clickear). La protección del start ya la dan:
+    //   - firma HMAC + freshness del ts (±5min) en verifyStartSignature → anti-forja
+    //     y anti-replay de links viejos capturados.
+    //   - oauth_state one-use (se consume en el callback) → anti-replay del callback.
+    //   - nonce one-use del lado del PLUGIN en su callback (hardening #29).
+    // Iniciar el OAuth varias veces es inocuo: solo redirige a TiendaNube a loguear;
+    // sin completar el callback no pasa nada.
 
     // Hardening #24: persistir state server-side. El state que va a ML es
     // solo un ID random opaco — el server lookup el contexto en callback.
