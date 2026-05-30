@@ -372,10 +372,12 @@ async function advanceWatermark(accountId, startedAt) {
  * el central los manda agrupados en PATCH /products/stock-price (50 por request)
  * para respetar el rate-limit, y reporta el resultado por variante.
  *
- * input.pushes = [{ tn_product_id, variant_id, stock, price?, apply? }]
- *   variant_id → variante TN a actualizar (clave del bulk).
- *   stock      → cantidad; null/'' = ilimitado en TN.
- *   price      → opcional; si viene, se actualiza también.
+ * input.pushes = [{ tn_product_id, variant_id, stock, price?, promotional_price?, apply? }]
+ *   variant_id          → variante TN a actualizar (clave del bulk).
+ *   stock               → cantidad; null/'' = ilimitado en TN.
+ *   price               → opcional; si viene, se actualiza también.
+ *   promotional_price   → opcional (>0); precio de OFERTA. El bulk stock-price NO
+ *                         lo soporta → se aplica por variante con PUT /variants/{id}.
  *   apply      → blob opaco que el plugin usa para sincronizar su cache; el
  *                central no lo interpreta, lo devuelve tal cual en el result.
  *
@@ -470,6 +472,32 @@ async function processPushJob(job) {
                 results.push(r);
                 if (r.ok) pushed++; else failed++;
                 done++;
+            }
+        }
+
+        // Precio de OFERTA (promotional_price): el bulk PATCH /products/stock-price
+        // NO lo soporta → lo aplicamos por variante con PUT /products/{id}/variants/{vid}.
+        // Solo para las variantes del batch que traen promotional_price (>0).
+        for (const pu of batch) {
+            if (pu.promotional_price === undefined || pu.promotional_price === null) continue;
+            const promo = Number(pu.promotional_price);
+            if (!(promo > 0)) continue;
+            await throttle(lastRate);
+            try {
+                const pr = await tnUpdateVariant(account, token, pu.tn_product_id, pu.variant_id, { promotional_price: promo });
+                lastRate = pr.rate;
+                const rr = results.find((r) => r.variant_id === Number(pu.variant_id));
+                if (!pr.ok) {
+                    const msg = tnErrorMessage(pr.data, pr.status);
+                    console.warn(`[worker] promo PUT falló variante ${pu.variant_id}: ${msg}`);
+                    if (rr) { rr.promo_ok = false; rr.promo_error = msg; }
+                } else if (rr) {
+                    rr.promo_ok = true;
+                }
+            } catch (err) {
+                console.warn(`[worker] promo PUT excepción variante ${pu.variant_id}: ${err.message}`);
+                const rr = results.find((r) => r.variant_id === Number(pu.variant_id));
+                if (rr) { rr.promo_ok = false; rr.promo_error = err.message; }
             }
         }
 
