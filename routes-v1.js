@@ -801,13 +801,14 @@ export function mountV1(app, opts = {}) {
 
     // -------------------------------------------------------------------------
     // POST /v1/orders/ack
-    // Body: { ml_order_ids: ["123", ...] }
+    // Body: { tn_order_ids: ["123", ...] }   (acepta ml_order_ids como fallback legacy)
     // El plugin confirma que aplicó esas órdenes a su ledger. Marcamos todas
     // las order_events de esas órdenes como delivered.
     // -------------------------------------------------------------------------
     app.post(p('/v1/orders/ack'), authAccount, async (req, res) => {
-        const ids = Array.isArray(req.body && req.body.ml_order_ids)
-            ? req.body.ml_order_ids.map(String).filter(Boolean)
+        const rawIds = (req.body && (req.body.tn_order_ids || req.body.ml_order_ids)) || null;
+        const ids = Array.isArray(rawIds)
+            ? rawIds.map(String).filter(Boolean)
             : [];
         if (!ids.length) return res.json({ ok: true, marked: 0 });
         const r = await query(
