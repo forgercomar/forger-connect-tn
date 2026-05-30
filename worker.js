@@ -481,8 +481,10 @@ async function processPushJob(job) {
         for (const pu of batch) {
             if (pu.promotional_price === undefined) continue;
             const promo = Number(pu.promotional_price);
-            // promo > 0 → setear la oferta; promo == 0 → QUITARLA (null en TN).
-            const promoBody = promo > 0 ? promo : null;
+            // promo > 0 → setear la oferta; promo == 0 → QUITARLA. TiendaNube IGNORA
+            // null en el PUT (lo trata como "no cambiar"); para borrar hay que mandar
+            // string vacío "" (verificado contra la API real 2026-05-30).
+            const promoBody = promo > 0 ? promo : '';
             await throttle(lastRate);
             try {
                 const pr = await tnUpdateVariant(account, token, pu.tn_product_id, pu.variant_id, { promotional_price: promoBody });
