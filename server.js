@@ -54,6 +54,7 @@ import { ping as dbPing, query as dbQuery } from './db.js';
 import { startWorker } from './worker.js';
 import { startScheduler } from './scheduler.js';
 import { createRateLimiter } from './rate-limit.js';
+import { licenseConfig, refreshDenylist, addToDenylist } from './license-enforce.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -148,6 +149,7 @@ const PORT             = Number(process.env.PORT || 3000);
 const TN_CLIENT_ID     = process.env.TN_CLIENT_ID || '';
 const TN_CLIENT_SECRET = process.env.TN_CLIENT_SECRET || '';
 const HUB_SECRET       = process.env.WFTN_OAUTH_HUB_SECRET || '';
+const LICENSE_REVOKE_SECRET = process.env.LICENSE_REVOKE_SECRET || ''; // revoke S2S: secreto DEDICADO (paridad con connect-ml)
 // Base de las páginas de OAuth de TiendaNube (authorize + token exchange).
 // Para tiendas de Brasil (Nuvemshop): https://www.nuvemshop.com.br
 const TN_OAUTH_BASE    = (process.env.TN_OAUTH_BASE || 'https://www.tiendanube.com').replace(/\/$/, '');
@@ -651,6 +653,78 @@ app.get(['/mappings/count', '/connect-tn/mappings/count'], (req, res) => {
             try { fs.accessSync(DATA_DIR, fs.constants.W_OK); return true; } catch (_) { return false; }
         })(),
     });
+});
+
+// ============================================================================
+// POST /internal/license-revoked — el license-api avisa que una licencia fue
+// revocada antes de su exp natural. La sumamos a la denylist (memoria + DB) para
+// que el enforcement la rechace de inmediato, ganándole a la gracia.
+//
+// Auth server-to-server UNIFICADA con connect-ml (paridad de seguridad):
+//   HMAC-SHA256(rawBody, LICENSE_REVOKE_SECRET) en X-Wf-Revoke-Sig (HEX)
+//   + X-Wf-Revoke-Ts (unix seconds, ±5min anti-replay) + nonce one-use
+//   (request_nonces, purpose='license_revoke'). Secreto DEDICADO — NO reusa el
+//   HUB_SECRET global. Sin firma válida → 401. Única forma de mutar la denylist.
+//
+// Body JSON: { license_id: string, nonce?: string, reason?: string }
+// ============================================================================
+app.post(['/internal/license-revoked', '/connect-tn/internal/license-revoked'], async (req, res) => {
+    if (!LICENSE_REVOKE_SECRET) {
+        // Sin secret no podemos autenticar — fail-closed para este endpoint.
+        return res.status(503).json({ ok: false, error: 'revoke_disabled' });
+    }
+    const sigGiven = String(req.get('X-Wf-Revoke-Sig') || '');
+    const tsGiven  = String(req.get('X-Wf-Revoke-Ts')  || '');
+    const raw      = req.rawBody || '';
+    if (!sigGiven || !tsGiven) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    // 1) HMAC sobre el body crudo (constant-time).
+    let sigOk = false;
+    try {
+        const expected = crypto.createHmac('sha256', LICENSE_REVOKE_SECRET).update(raw, 'utf8').digest('hex');
+        const a = Buffer.from(expected);
+        const b = Buffer.from(sigGiven);
+        sigOk = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) { sigOk = false; }
+    if (!sigOk) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    // 2) Ventana de timestamp ±5min.
+    const tsNum = parseInt(tsGiven, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 300) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    const licenseId = String((req.body && req.body.license_id) || '').trim();
+    const reqNonce  = String((req.body && req.body.nonce) || '').trim();
+    const reason    = (req.body && req.body.reason) ? String(req.body.reason) : null;
+    if (!licenseId) {
+        return res.status(400).json({ ok: false, error: 'missing_license_id' });
+    }
+    // 3) Nonce one-use (si vino).
+    if (reqNonce) {
+        try {
+            const dup = await dbQuery(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [reqNonce, 'license_revoke', nowSec]
+            );
+            if (dup.rowCount === 0) {
+                return res.status(409).json({ ok: false, error: 'replay' });
+            }
+        } catch (e) {
+            console.error('[license-revoked] nonce insert error:', e.message);
+            return res.status(500).json({ ok: false, error: 'internal' });
+        }
+    }
+    try {
+        await addToDenylist(licenseId, reason);
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: 'persist_failed', message: e.message });
+    }
+    console.warn(`[license] revoke recibido license_id=${licenseId} reason=${reason || '-'}`);
+    return res.json({ ok: true, revoked: licenseId });
 });
 
 // ============================================================================
@@ -1208,6 +1282,15 @@ app.listen(PORT, () => {
     console.log(`[forger-connect-tn] listening on :${PORT}`);
     console.log(`[forger-connect-tn] BASE_URL = ${BASE_URL}`);
     console.log(`[forger-connect-tn] CALLBACK_URL = ${CALLBACK_URL}`);
+    // Estado del enforcement de licencia (Fase 6). 'observe' es el default y NO
+    // bloquea; 'off' (o pública faltante) tampoco. Solo 'enforce' + pública corta.
+    const lic = licenseConfig();
+    console.log(`[forger-connect-tn] LICENSE_ENFORCE = ${lic.mode} (active=${lic.active}, enforcing=${lic.enforcing}, pubkey=${lic.hasPublicKey}, grace=${lic.graceSec}s)`);
+    // Cargar la denylist desde DB + refrescar cada 5 min (revokes entre réplicas
+    // / persistidos sobreviven reinicios). Best-effort: si la DB no está, el
+    // refresh siguiente la levanta.
+    refreshDenylist().catch(() => {});
+    setInterval(() => { refreshDenylist().catch(() => {}); }, 5 * 60 * 1000).unref();
     // Arranca el worker del Central Orchestrator (procesa jobs de sync).
     // Si la DB no está disponible, el worker logguea el error y reintenta
     // en el próximo tick — no tumba el proceso.

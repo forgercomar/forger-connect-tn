@@ -29,6 +29,12 @@ import {
     generatePublicId,
     encryptToken,
 } from './auth.js';
+import {
+    evaluateToken,
+    isRevoked,
+    licenseConfig,
+    LICENSE_TOKEN_HEADER,
+} from './license-enforce.js';
 
 // =============================================================================
 // Constantes del job runtime
@@ -68,6 +74,103 @@ function getRawBody(req) {
     return req.rawBody || '';
 }
 
+// =============================================================================
+// Enforcement del capability-token de licencia (Fase 6) — capa ADICIONAL.
+//
+// El token viaja en el header X-Wftn-License-Token (independiente de la firma
+// HMAC de cuenta, que sigue intacta). Estas helpers deciden si negar el acceso
+// según LICENSE_ENFORCE (off | observe | enforce) y la gracia.
+// =============================================================================
+
+const GENERIC_LICENSE_ERROR = { ok: false, error: 'license_invalid' };
+
+/** Lee el capability-token crudo del request (case-insensitive vía req.get). */
+function getLicenseToken(req) {
+    return req.get(LICENSE_TOKEN_HEADER) || '';
+}
+
+/**
+ * Evalúa el token para un endpoint SIN gracia (handshake).
+ *
+ * Devuelve { decision: 'allow'|'deny', verdict, cfg }.
+ *   - off / observe          → SIEMPRE allow (observe loguea).
+ *   - enforce + token válido  → allow.
+ *   - enforce + token inválido → deny.
+ *
+ * NO escribe DB. El caller decide el 403 genérico.
+ */
+function checkLicenseNoGrace(req, { expectDomain, label } = {}) {
+    const token = getLicenseToken(req);
+    const { verdict, cfg } = evaluateToken(token, { expectDomain });
+    if (!cfg.active) {
+        return { decision: 'allow', verdict, cfg };
+    }
+    if (verdict.valid) {
+        return { decision: 'allow', verdict, cfg };
+    }
+    // Inválido. En observe NO bloqueamos: solo medimos quién no manda token OK.
+    const lic = verdict.payload && verdict.payload.license_id ? verdict.payload.license_id : '-';
+    console.warn(`[license] ${label || 'request'} token inválido reason=${verdict.reason} license_id=${lic} mode=${cfg.mode} -> ${cfg.enforcing ? 'DENY' : 'observe(allow)'}`);
+    return { decision: cfg.enforcing ? 'deny' : 'allow', verdict, cfg };
+}
+
+/**
+ * Evalúa el token para /v1/jobs (sync/push) CON gracia.
+ *
+ * @param {object} account  fila accounts (necesita id + last_valid_license_token_at).
+ *
+ * Reglas:
+ *   - off / observe → allow (observe loguea); igual sella el watermark si el
+ *     token es válido, para que la gracia tenga datos el día que se prenda enforce.
+ *   - token válido → allow + sella accounts.last_valid_license_token_at = NOW().
+ *   - token inválido + dentro de gracia → allow (no romper por caída de infra).
+ *     EXCEPTO si está revocado: el revoke gana SIEMPRE sobre la gracia.
+ *   - token inválido + fuera de gracia → deny (solo si enforcing).
+ *
+ * Devuelve { decision, verdict, cfg, sealed }.
+ */
+async function checkLicenseWithGrace(req, account, { expectDomain, label } = {}) {
+    const token = getLicenseToken(req);
+    const { verdict, cfg } = evaluateToken(token, { expectDomain });
+
+    // Token válido: sellar watermark de gracia (fire-and-forget) en cualquier
+    // modo activo. No bloquea nada.
+    if (cfg.active && verdict.valid) {
+        query('UPDATE accounts SET last_valid_license_token_at = NOW() WHERE id = $1', [account.id])
+            .catch((e) => console.warn('[license] sello watermark falló:', e.message));
+        return { decision: 'allow', verdict, cfg, sealed: true };
+    }
+
+    if (!cfg.active) {
+        return { decision: 'allow', verdict, cfg, sealed: false };
+    }
+
+    // Token inválido. El revoke explícito gana SIEMPRE — sin gracia.
+    const revoked = isRevoked(verdict);
+    let withinGrace = false;
+    if (!revoked && cfg.graceSec > 0) {
+        const lastTs = account.last_valid_license_token_at
+            ? new Date(account.last_valid_license_token_at).getTime()
+            : 0;
+        if (lastTs > 0) {
+            const ageSec = (Date.now() - lastTs) / 1000;
+            withinGrace = ageSec <= cfg.graceSec;
+        }
+    }
+
+    const lic = verdict.payload && verdict.payload.license_id ? verdict.payload.license_id : '-';
+    if (revoked) {
+        console.warn(`[license] ${label || 'jobs'} REVOCADO license_id=${lic} mode=${cfg.mode} -> ${cfg.enforcing ? 'DENY' : 'observe(allow)'}`);
+        return { decision: cfg.enforcing ? 'deny' : 'allow', verdict, cfg, sealed: false };
+    }
+    if (withinGrace) {
+        console.warn(`[license] ${label || 'jobs'} token inválido reason=${verdict.reason} license_id=${lic} mode=${cfg.mode} -> GRACIA(allow)`);
+        return { decision: 'allow', verdict, cfg, sealed: false };
+    }
+    console.warn(`[license] ${label || 'jobs'} token inválido reason=${verdict.reason} license_id=${lic} mode=${cfg.mode} fuera_de_gracia -> ${cfg.enforcing ? 'DENY' : 'observe(allow)'}`);
+    return { decision: cfg.enforcing ? 'deny' : 'allow', verdict, cfg, sealed: false };
+}
+
 /**
  * Middleware que verifica el HMAC + carga la cuenta en req.account.
  * Usar en las rutas que requieren auth de cuenta.
@@ -82,7 +185,8 @@ async function authAccount(req, res, next) {
     let acc;
     try {
         const r = await query(
-            `SELECT id, public_id, store_id, store_name, store_lang, site_url, shared_secret, revoked_at
+            `SELECT id, public_id, store_id, store_name, store_lang, site_url, shared_secret, revoked_at,
+                    last_valid_license_token_at
              FROM accounts WHERE public_id = $1`,
             [publicId]
         );
@@ -294,6 +398,15 @@ export function mountV1(app, opts = {}) {
             return res.status(400).json({ ok: false, error: 'missing_fields', message: 'store_id y site_url son obligatorios.' });
         }
 
+        // Enforcement de licencia (Fase 6) — capa ADICIONAL sobre el HMAC del
+        // HUB_SECRET ya verificado arriba. El handshake es "entrada nueva": NO
+        // tiene gracia. Solo bloquea si LICENSE_ENFORCE=enforce; observe loguea.
+        // 403 genérico al cliente; el reason detallado solo a log.
+        const licCheck = checkLicenseNoGrace(req, { expectDomain: siteUrl, label: 'handshake' });
+        if (licCheck.decision === 'deny') {
+            return res.status(403).json(GENERIC_LICENSE_ERROR);
+        }
+
         const newSecret = generateSecret();
         let enc = { ciphertext: '', iv: '' };
         if (accessT) {
@@ -362,6 +475,26 @@ export function mountV1(app, opts = {}) {
     //   { ok: true, job_id: "job_...", steps_total: N, status: "pending" }
     // -------------------------------------------------------------------------
     app.post(p('/v1/jobs'), authAccount, async (req, res) => {
+        // Enforcement de licencia (Fase 6) CON gracia: si el token falta/expiró
+        // pero la cuenta tuvo uno válido dentro de GRACE_PERIOD_SEC, se permite
+        // (no romper operación por caída de infra). El revoke explícito gana
+        // sobre la gracia. Solo bloquea si LICENSE_ENFORCE=enforce.
+        let licJob;
+        try {
+            licJob = await checkLicenseWithGrace(req, req.account, {
+                expectDomain: req.account.site_url,
+                label: 'jobs',
+            });
+        } catch (e) {
+            // fail-safe: si el chequeo de licencia explota, NO cortamos la
+            // operación (la auth HMAC ya pasó). Logueamos y seguimos.
+            console.warn('[license] checkLicenseWithGrace error (allow):', e.message);
+            licJob = { decision: 'allow' };
+        }
+        if (licJob.decision === 'deny') {
+            return res.status(403).json(GENERIC_LICENSE_ERROR);
+        }
+
         const body = req.body || {};
         const type = String(body.type || '');
         if (!VALID_JOB_TYPES.has(type)) {

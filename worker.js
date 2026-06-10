@@ -29,6 +29,7 @@
  */
 
 import { query } from './db.js';
+import { workerLicenseGate } from './license-enforce.js';
 import {
     getValidAccessToken,
     tnListProducts,
@@ -297,6 +298,16 @@ async function processSyncJob(job) {
     const account = accR.rows[0];
     if (account.revoked_at) throw new Error('cuenta revocada');
 
+    // Gate de licencia (Fase 6). Solo bloquea con LICENSE_ENFORCE=enforce y la
+    // gracia vencida; off/observe siempre pasan (observe loguea).
+    const gate = workerLicenseGate(account);
+    if (!gate.allow) {
+        throw new Error(`license_invalid (${gate.reason})`);
+    }
+    if (gate.reason !== 'off' && gate.reason !== 'within_grace' && gate.reason !== 'no_watermark') {
+        console.warn(`[worker] license gate sync job ${job.public_id} acc=${account.id}: ${gate.reason}`);
+    }
+
     const token = await getValidAccessToken(account);
 
     const input = (job.input && typeof job.input === 'object') ? job.input : {};
@@ -390,6 +401,17 @@ async function processPushJob(job) {
     if (!accR.rowCount) throw new Error('cuenta no encontrada');
     const account = accR.rows[0];
     if (account.revoked_at) throw new Error('cuenta revocada');
+
+    // Gate de licencia (Fase 6). Igual que el sync: solo corta con enforce +
+    // gracia vencida.
+    const gate = workerLicenseGate(account);
+    if (!gate.allow) {
+        throw new Error(`license_invalid (${gate.reason})`);
+    }
+    if (gate.reason !== 'off' && gate.reason !== 'within_grace' && gate.reason !== 'no_watermark') {
+        console.warn(`[worker] license gate push job ${job.public_id} acc=${account.id}: ${gate.reason}`);
+    }
+
     const token = await getValidAccessToken(account);
 
     const input  = (job.input && typeof job.input === 'object') ? job.input : {};
