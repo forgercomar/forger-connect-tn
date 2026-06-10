@@ -51,12 +51,14 @@ let _publicKeyLoaded = false;
 function loadPublicKey() {
     if (_publicKeyLoaded) return _publicKey;
     _publicKeyLoaded = true;
-    let pem = process.env.LICENSE_API_PUBLIC_KEY || '';
+    let pem = String(process.env.LICENSE_API_PUBLIC_KEY || '').trim();
     if (!pem) { _publicKey = null; return null; }
-    // Soportar el valor con '\n' literales (escapados por el panel de envs).
-    if (pem.indexOf('\\n') >= 0 && pem.indexOf('\n') < 0) {
-        pem = pem.replace(/\\n/g, '\n');
+    // Robusto contra cómo los paneles de envs (EasyPanel) guardan el PEM multilínea:
+    // comillas envolventes + '\n'/'\r\n' literales escapados + CR reales.
+    if ((pem.startsWith('"') && pem.endsWith('"')) || (pem.startsWith("'") && pem.endsWith("'"))) {
+        pem = pem.slice(1, -1);
     }
+    pem = pem.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '').replace(/\r/g, '');
     try {
         _publicKey = crypto.createPublicKey(pem);
     } catch (e) {
