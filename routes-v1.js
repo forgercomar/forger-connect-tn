@@ -106,6 +106,7 @@ function checkLicenseNoGrace(req, { expectDomain, label } = {}) {
         return { decision: 'allow', verdict, cfg };
     }
     if (verdict.valid) {
+        if (!cfg.enforcing) console.log(`[license][observe] ${label || 'handshake'} token OK`);
         return { decision: 'allow', verdict, cfg };
     }
     // Inválido. En observe NO bloqueamos: solo medimos quién no manda token OK.
@@ -138,6 +139,13 @@ async function checkLicenseWithGrace(req, account, { expectDomain, label } = {})
     if (cfg.active && verdict.valid) {
         query('UPDATE accounts SET last_valid_license_token_at = NOW() WHERE id = $1', [account.id])
             .catch((e) => console.warn('[license] sello watermark falló:', e.message));
+        // En observe logueamos el OK → confirmación visible de que el token llega
+        // y verifica (en enforce queda silencioso para no hacer ruido).
+        if (!cfg.enforcing) {
+            const _lic = String((verdict.payload && verdict.payload.license_id) || '').slice(0, 8);
+            const _exp = verdict.payload && typeof verdict.payload.exp === 'number' ? (verdict.payload.exp - Math.floor(Date.now() / 1000)) : '?';
+            console.log(`[license][observe] ${label || 'jobs'} token OK license=${_lic} exp_in=${_exp}s`);
+        }
         return { decision: 'allow', verdict, cfg, sealed: true };
     }
 
