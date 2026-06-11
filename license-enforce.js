@@ -109,6 +109,20 @@ export async function addToDenylist(licenseId, reason) {
     return true;
 }
 
+/** Saca un license_id de la denylist (memoria + DB). Idempotente. */
+export async function removeFromDenylist(licenseId) {
+    const id = String(licenseId || '').trim();
+    if (!id) return false;
+    _denylist.delete(id);
+    try {
+        await query('DELETE FROM license_denylist WHERE license_id = $1', [id]);
+    } catch (e) {
+        console.error('[license] removeFromDenylist persist falló:', e.message);
+        // Igual quedó fuera de la memoria de esta instancia.
+    }
+    return true;
+}
+
 /** Snapshot del Set para pasarlo a verifyCapabilityToken. */
 export function getDenylist() {
     return _denylist;

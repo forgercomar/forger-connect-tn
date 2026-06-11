@@ -54,7 +54,7 @@ import { ping as dbPing, query as dbQuery } from './db.js';
 import { startWorker } from './worker.js';
 import { startScheduler } from './scheduler.js';
 import { createRateLimiter } from './rate-limit.js';
-import { licenseConfig, refreshDenylist, addToDenylist } from './license-enforce.js';
+import { licenseConfig, refreshDenylist, addToDenylist, removeFromDenylist } from './license-enforce.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -725,6 +725,82 @@ app.post(['/internal/license-revoked', '/connect-tn/internal/license-revoked'], 
     }
     console.warn(`[license] revoke recibido license_id=${licenseId} reason=${reason || '-'}`);
     return res.json({ ok: true, revoked: licenseId });
+});
+
+// ============================================================================
+// POST /internal/license-activated — ESPEJO EXACTO de /internal/license-revoked.
+// El license-api avisa que una licencia fue DESBLOQUEADA (un-revoke): la sacamos
+// de la denylist (memoria + DB) para que el enforcement vuelva a permitirla.
+//
+// El license-api manda este webhook desde syncLicenseBlockState() SOLO cuando la
+// licencia NO debe estar bloqueada (status no bloqueante && is_blocked=false).
+//
+// Misma auth server-to-server que el revoke (paridad de seguridad):
+//   HMAC-SHA256(rawBody, LICENSE_REVOKE_SECRET) en X-Wf-Revoke-Sig (HEX)
+//   + X-Wf-Revoke-Ts (unix seconds, ±5min anti-replay) + nonce one-use
+//   (request_nonces, purpose='license_activate'). Secreto DEDICADO compartido con
+//   el revoke. Sin firma válida → 401.
+//
+// Body JSON: { license_id: string, nonce?: string, reason?: string }
+// ============================================================================
+app.post(['/internal/license-activated', '/connect-tn/internal/license-activated'], async (req, res) => {
+    if (!LICENSE_REVOKE_SECRET) {
+        // Sin secret no podemos autenticar — fail-closed para este endpoint.
+        return res.status(503).json({ ok: false, error: 'revoke_disabled' });
+    }
+    const sigGiven = String(req.get('X-Wf-Revoke-Sig') || '');
+    const tsGiven  = String(req.get('X-Wf-Revoke-Ts')  || '');
+    const raw      = req.rawBody || '';
+    if (!sigGiven || !tsGiven) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    // 1) HMAC sobre el body crudo (constant-time).
+    let sigOk = false;
+    try {
+        const expected = crypto.createHmac('sha256', LICENSE_REVOKE_SECRET).update(raw, 'utf8').digest('hex');
+        const a = Buffer.from(expected);
+        const b = Buffer.from(sigGiven);
+        sigOk = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) { sigOk = false; }
+    if (!sigOk) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    // 2) Ventana de timestamp ±5min.
+    const tsNum = parseInt(tsGiven, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 300) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    const licenseId = String((req.body && req.body.license_id) || '').trim();
+    const reqNonce  = String((req.body && req.body.nonce) || '').trim();
+    const reason    = (req.body && req.body.reason) ? String(req.body.reason) : null;
+    if (!licenseId) {
+        return res.status(400).json({ ok: false, error: 'missing_license_id' });
+    }
+    // 3) Nonce one-use (si vino). purpose distinto del revoke para que un nonce
+    //    no sea reusable entre ambos webhooks.
+    if (reqNonce) {
+        try {
+            const dup = await dbQuery(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [reqNonce, 'license_activate', nowSec]
+            );
+            if (dup.rowCount === 0) {
+                return res.status(409).json({ ok: false, error: 'replay' });
+            }
+        } catch (e) {
+            console.error('[license-activated] nonce insert error:', e.message);
+            return res.status(500).json({ ok: false, error: 'internal' });
+        }
+    }
+    try {
+        await removeFromDenylist(licenseId);
+    } catch (e) {
+        return res.status(500).json({ ok: false, error: 'persist_failed', message: e.message });
+    }
+    console.warn(`[license] activate recibido license_id=${licenseId} reason=${reason || '-'}`);
+    return res.json({ ok: true, activated: licenseId });
 });
 
 // ============================================================================
