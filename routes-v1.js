@@ -28,11 +28,12 @@ import {
     generateSecret,
     generatePublicId,
     encryptToken,
+    sealSecret,
+    openSecret,
 } from './auth.js';
 import {
     evaluateToken,
     isRevoked,
-    licenseConfig,
     LICENSE_TOKEN_HEADER,
 } from './license-enforce.js';
 
@@ -116,67 +117,84 @@ function checkLicenseNoGrace(req, { expectDomain, label } = {}) {
 }
 
 /**
- * Evalúa el token para /v1/jobs (sync/push) CON gracia.
+ * Verifica el capability-token de un request contra la config de licencia.
+ * ESPEJO de connect-ml (verifyLicenseForAccount): pura respecto de la red, NO
+ * escribe DB acá (el caller decide cuándo sellar el watermark/claim).
  *
- * @param {object} account  fila accounts (necesita id + last_valid_license_token_at).
- *
- * Reglas:
- *   - off / observe → allow (observe loguea); igual sella el watermark si el
- *     token es válido, para que la gracia tenga datos el día que se prenda enforce.
- *   - token válido → allow + sella accounts.last_valid_license_token_at = NOW().
- *   - token inválido + dentro de gracia → allow (no romper por caída de infra).
- *     EXCEPTO si está revocado: el revoke gana SIEMPRE sobre la gracia.
- *   - token inválido + fuera de gracia → deny (solo si enforcing).
- *
- * Devuelve { decision, verdict, cfg, sealed }.
+ * @param {string}  token        valor crudo del header X-Wftn-License-Token
+ * @param {object}  account      fila de accounts (para expectDomain = site_url)
+ * @returns {{ active, valid, reason, payload, cfg }}
+ *   - active: false → enforcement OFF (o sin pública); el caller permite sin más.
+ *   - valid:  true  → token verificado OK (firma + exp + dominio + producto + no revocado).
+ *   - reason: detalle (solo a log) cuando valid=false.
+ *   - payload: claims decodificados (presente aunque valid=false en algunos casos).
  */
-async function checkLicenseWithGrace(req, account, { expectDomain, label } = {}) {
-    const token = getLicenseToken(req);
-    const { verdict, cfg } = evaluateToken(token, { expectDomain });
-
-    // Token válido: sellar watermark de gracia (fire-and-forget) en cualquier
-    // modo activo. No bloquea nada.
-    if (cfg.active && verdict.valid) {
-        query('UPDATE accounts SET last_valid_license_token_at = NOW() WHERE id = $1', [account.id])
-            .catch((e) => console.warn('[license] sello watermark falló:', e.message));
-        // En observe logueamos el OK → confirmación visible de que el token llega
-        // y verifica (en enforce queda silencioso para no hacer ruido).
-        if (!cfg.enforcing) {
-            const _lic = String((verdict.payload && verdict.payload.license_id) || '').slice(0, 8);
-            const _exp = verdict.payload && typeof verdict.payload.exp === 'number' ? (verdict.payload.exp - Math.floor(Date.now() / 1000)) : '?';
-            console.log(`[license][observe] ${label || 'jobs'} token OK license=${_lic} exp_in=${_exp}s`);
-        }
-        return { decision: 'allow', verdict, cfg, sealed: true };
-    }
-
+function verifyLicenseForAccount(token, account) {
+    const { verdict, cfg } = evaluateToken(String(token || ''), {
+        expectDomain: account && account.site_url ? account.site_url : undefined,
+    });
     if (!cfg.active) {
-        return { decision: 'allow', verdict, cfg, sealed: false };
+        return { active: false, valid: false, reason: 'inactive', payload: null, cfg };
     }
+    return { active: true, valid: verdict.valid, reason: verdict.reason || null, payload: verdict.payload || null, cfg };
+}
 
-    // Token inválido. El revoke explícito gana SIEMPRE — sin gracia.
-    const revoked = isRevoked(verdict);
-    let withinGrace = false;
-    if (!revoked && cfg.graceSec > 0) {
-        const lastTs = account.last_valid_license_token_at
-            ? new Date(account.last_valid_license_token_at).getTime()
-            : 0;
-        if (lastTs > 0) {
-            const ageSec = (Date.now() - lastTs) / 1000;
-            withinGrace = ageSec <= cfg.graceSec;
-        }
+// Throttle del sello del watermark (ESPEJO de connect-ml): el plugin pollea
+// next-batch/report agresivamente; sin throttle escribiríamos accounts en CADA
+// request /v1/* válido (el mismo problema que motivó bumpAccountLastSeenThrottled).
+// 60s de precisión sobra para la gracia (que mide en horas). Se fuerza el write
+// cuando cambia el claim (exp/license_id).
+const _stampCache = new Map(); // accountId → { at: epochMs, exp, licenseId }
+const STAMP_THROTTLE_MS = 60_000;
+setInterval(() => {
+    const cutoff = Date.now() - 60 * 60_000;
+    for (const [k, v] of _stampCache.entries()) {
+        if (v.at < cutoff) _stampCache.delete(k);
     }
+}, 10 * 60_000).unref();
 
-    const lic = verdict.payload && verdict.payload.license_id ? verdict.payload.license_id : '-';
-    if (revoked) {
-        console.warn(`[license] ${label || 'jobs'} REVOCADO license_id=${lic} mode=${cfg.mode} -> ${cfg.enforcing ? 'DENY' : 'observe(allow)'}`);
-        return { decision: cfg.enforcing ? 'deny' : 'allow', verdict, cfg, sealed: false };
+/**
+ * Sella en accounts el último token VÁLIDO: ancla de la gracia + copia del claim
+ * (license_id para el corte por denylist del worker, license_exp para su gate por
+ * vencimiento real — migración 008). Fire-and-forget (no bloquea la respuesta).
+ * license_exp viene del claim.exp (sec). Throttle 60s/cuenta salvo que el claim
+ * haya cambiado (renovación/upgrade).
+ */
+function stampValidLicense(accountId, payload) {
+    if (!accountId || !payload) return;
+    const exp = typeof payload.exp === 'number' ? payload.exp : null;
+    const licenseId = payload.license_id ? String(payload.license_id) : null;
+    const prev = _stampCache.get(accountId);
+    const now = Date.now();
+    const claimChanged = !prev || prev.exp !== exp || prev.licenseId !== licenseId;
+    if (prev && !claimChanged && (now - prev.at) < STAMP_THROTTLE_MS) {
+        return; // ya sellado recientemente con el mismo claim
     }
-    if (withinGrace) {
-        console.warn(`[license] ${label || 'jobs'} token inválido reason=${verdict.reason} license_id=${lic} mode=${cfg.mode} -> GRACIA(allow)`);
-        return { decision: 'allow', verdict, cfg, sealed: false };
-    }
-    console.warn(`[license] ${label || 'jobs'} token inválido reason=${verdict.reason} license_id=${lic} mode=${cfg.mode} fuera_de_gracia -> ${cfg.enforcing ? 'DENY' : 'observe(allow)'}`);
-    return { decision: cfg.enforcing ? 'deny' : 'allow', verdict, cfg, sealed: false };
+    _stampCache.set(accountId, { at: now, exp, licenseId });
+    query(
+        `UPDATE accounts
+            SET last_valid_license_token_at = NOW(),
+                license_id  = COALESCE($2, license_id),
+                license_exp = CASE WHEN $3::bigint IS NOT NULL THEN to_timestamp($3) ELSE license_exp END
+          WHERE id = $1`,
+        [accountId, licenseId, exp]
+    ).catch((e) => console.warn('[license] stampValidLicense failed:', e.message));
+}
+
+/**
+ * ¿La cuenta está dentro del período de gracia? Permite seguir operando los
+ * endpoints account-authed ante token ausente/expirado por caída de infra del
+ * license-api, SIEMPRE que haya presentado un token válido dentro de
+ * GRACE_PERIOD_SEC. La gracia NO aplica al handshake (entrada nueva) ni vence
+ * una denylist.
+ */
+function withinGrace(account, graceSec) {
+    if (!(graceSec > 0)) return false;
+    const ts = account && account.last_valid_license_token_at
+        ? new Date(account.last_valid_license_token_at).getTime()
+        : 0;
+    if (!ts) return false;
+    return (Date.now() - ts) <= graceSec * 1000;
 }
 
 /**
@@ -194,7 +212,7 @@ async function authAccount(req, res, next) {
     try {
         const r = await query(
             `SELECT id, public_id, store_id, store_name, store_lang, site_url, shared_secret, revoked_at,
-                    last_valid_license_token_at
+                    last_valid_license_token_at, license_id, license_exp
              FROM accounts WHERE public_id = $1`,
             [publicId]
         );
@@ -205,8 +223,17 @@ async function authAccount(req, res, next) {
     if (!acc || acc.revoked_at) {
         return res.status(401).json({ ok: false, error: 'unknown_account' });
     }
+    // shared_secret puede estar cifrado at-rest (formato enc1) o plano (fila
+    // legacy). openSecret resuelve ambos; null = no se pudo descifrar (key
+    // rotada sin migrar / fila corrupta) → falla la auth de ESA cuenta, sin
+    // tirar el proceso. JAMÁS loguear el secreto.
+    const accSecret = openSecret(acc.shared_secret);
+    if (!accSecret) {
+        console.warn(`[v1] shared_secret ilegible acct=${acc.public_id} (key rotada o fila corrupta) — auth rechazada`);
+        return res.status(401).json({ ok: false, error: 'secret_unreadable', message: 'No se pudo validar el secreto de la cuenta. Reconectá la cuenta (handshake).' });
+    }
     const verdict = verifyRequest({
-        secret: acc.shared_secret,
+        secret: accSecret,
         method: req.method,
         path: req.originalUrl.split('?')[0], // sin query string
         ts,
@@ -216,6 +243,44 @@ async function authAccount(req, res, next) {
     if (!verdict.ok) {
         return res.status(401).json({ ok: false, error: 'bad_signature', message: verdict.reason });
     }
+
+    // -------------------------------------------------------------------------
+    // Capability-token de licencia (Fase 6) — capa ADICIONAL sobre el HMAC.
+    // ESPEJO de connect-ml: aplica a TODOS los endpoints account-authed (no solo
+    // POST /v1/jobs). CON gracia: si el token falta/expiró pero la cuenta
+    // presentó uno válido dentro de GRACE_PERIOD_SEC, permitimos igual (no romper
+    // operación por una caída del license-api). La denylist (revoke explícito)
+    // GANA sobre la gracia. En modo "observe" se loguea pero NUNCA se bloquea.
+    // En "off" no se verifica.
+    // -------------------------------------------------------------------------
+    const lic = verifyLicenseForAccount(getLicenseToken(req), acc);
+    if (lic.active) {
+        if (lic.valid) {
+            // Token OK → sella el ancla de gracia + copia del claim (fire-and-forget).
+            stampValidLicense(acc.id, lic.payload);
+            // En observe logueamos también el caso OK → confirmación visible de que el
+            // token llega y verifica (en enforce queda silencioso para no hacer ruido).
+            if (!lic.cfg.enforcing) {
+                const _exp = lic.payload && typeof lic.payload.exp === 'number' ? (lic.payload.exp - Math.floor(Date.now() / 1000)) : '?';
+                console.log(`[license][observe] token OK acct=${acc.public_id} license=${String((lic.payload && lic.payload.license_id) || '').slice(0, 8)} exp_in=${_exp}s`);
+            }
+        } else {
+            const revoked = isRevoked(lic);
+            const graced = !revoked && withinGrace(acc, lic.cfg.graceSec);
+            if (!graced) {
+                if (lic.cfg.enforcing) {
+                    console.warn(`[license] BLOQUEADO acct=${acc.public_id} reason=${lic.reason}` +
+                        (revoked ? ' (revoked: denylist gana sobre gracia)' : ' (sin gracia válida)'));
+                    return res.status(403).json(GENERIC_LICENSE_ERROR);
+                }
+                console.warn(`[license][observe] permitiría-bloquear acct=${acc.public_id} reason=${lic.reason}` +
+                    (revoked ? ' (revoked)' : '') + ' (modo observe — no se bloquea)');
+            } else {
+                console.warn(`[license] acct=${acc.public_id} token ${lic.reason} pero DENTRO de gracia — permitido`);
+            }
+        }
+    }
+
     req.account = acc;
     // Bump last_seen para detección de actividad. Fire-and-forget + throttle.
     // Antes pegabamos a Postgres en CADA request /v1/* — con polling agresivo
@@ -348,6 +413,26 @@ export function mountV1(app, opts = {}) {
     // -------------------------------------------------------------------------
     app.post(p('/v1/handshake'), rlHandshake, async (req, res) => {
         const body = req.body || {};
+
+        // ---------------------------------------------------------------------
+        // Capability-token de licencia (Fase 6) — SIN gracia. ESPEJO de connect-ml.
+        // El handshake registra/rota el shared_secret: es una ENTRADA NUEVA, no
+        // una operación recurrente, así que NO le aplica el período de gracia.
+        // expectDomain = site_url del body (la cuenta puede no existir aún). En
+        // modo "observe" se loguea pero NO se bloquea; en "off" no se verifica.
+        // Esto va ANTES de validar la firma del handshake (gate de licencia primero).
+        // ---------------------------------------------------------------------
+        let hsLicensePayload = null; // claim del token válido, para sellar tras el upsert
+        {
+            const licCheck = checkLicenseNoGrace(req, { expectDomain: String(body.site_url || ''), label: 'handshake' });
+            if (licCheck.decision === 'deny') {
+                return res.status(403).json(GENERIC_LICENSE_ERROR);
+            }
+            if (licCheck.cfg.active && licCheck.verdict.valid) {
+                hsLicensePayload = licCheck.verdict.payload || null;
+            }
+        }
+
         const sigGiven = String(body.handshake_sig || '');
         if (!sigGiven) {
             return res.status(400).json({ ok: false, error: 'missing_sig' });
@@ -406,16 +491,16 @@ export function mountV1(app, opts = {}) {
             return res.status(400).json({ ok: false, error: 'missing_fields', message: 'store_id y site_url son obligatorios.' });
         }
 
-        // Enforcement de licencia (Fase 6) — capa ADICIONAL sobre el HMAC del
-        // HUB_SECRET ya verificado arriba. El handshake es "entrada nueva": NO
-        // tiene gracia. Solo bloquea si LICENSE_ENFORCE=enforce; observe loguea.
-        // 403 genérico al cliente; el reason detallado solo a log.
-        const licCheck = checkLicenseNoGrace(req, { expectDomain: siteUrl, label: 'handshake' });
-        if (licCheck.decision === 'deny') {
-            return res.status(403).json(GENERIC_LICENSE_ERROR);
-        }
-
         const newSecret = generateSecret();
+        // At-rest: el secret viaja PLANO al plugin (protocolo intacto) pero en
+        // la DB se persiste cifrado (formato enc1, ver auth.js). Si la key de
+        // cifrado falta → 500 explícito, nunca guardar plano por accidente.
+        let storedSecret;
+        try {
+            storedSecret = sealSecret(newSecret);
+        } catch (err) {
+            return res.status(500).json({ ok: false, error: 'crypto_failed', message: err.message });
+        }
         let enc = { ciphertext: '', iv: '' };
         if (accessT) {
             try {
@@ -445,7 +530,7 @@ export function mountV1(app, opts = {}) {
                          access_token_iv  = COALESCE(NULLIF($7, ''), access_token_iv),
                          scope            = COALESCE(NULLIF($8, ''), scope)
                      WHERE id = $1`,
-                    [accId, nick, lang, siteUrl, newSecret, enc.ciphertext, enc.iv, scope]
+                    [accId, nick, lang, siteUrl, storedSecret, enc.ciphertext, enc.iv, scope]
                 );
             } else {
                 accPublic = generatePublicId('acc');
@@ -455,10 +540,14 @@ export function mountV1(app, opts = {}) {
                          shared_secret, access_token_enc, access_token_iv, scope)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      RETURNING id`,
-                    [accPublic, storeId, nick, lang, siteUrl, newSecret, enc.ciphertext, enc.iv, scope]
+                    [accPublic, storeId, nick, lang, siteUrl, storedSecret, enc.ciphertext, enc.iv, scope]
                 );
                 accId = ins.rows[0].id;
             }
+
+            // Si el handshake trajo un token VÁLIDO, sellamos el ancla de gracia
+            // + copia del claim ahora que la cuenta existe (fire-and-forget).
+            if (hsLicensePayload) stampValidLicense(accId, hsLicensePayload);
 
             return res.json({
                 ok: true,
@@ -483,26 +572,9 @@ export function mountV1(app, opts = {}) {
     //   { ok: true, job_id: "job_...", steps_total: N, status: "pending" }
     // -------------------------------------------------------------------------
     app.post(p('/v1/jobs'), authAccount, async (req, res) => {
-        // Enforcement de licencia (Fase 6) CON gracia: si el token falta/expiró
-        // pero la cuenta tuvo uno válido dentro de GRACE_PERIOD_SEC, se permite
-        // (no romper operación por caída de infra). El revoke explícito gana
-        // sobre la gracia. Solo bloquea si LICENSE_ENFORCE=enforce.
-        let licJob;
-        try {
-            licJob = await checkLicenseWithGrace(req, req.account, {
-                expectDomain: req.account.site_url,
-                label: 'jobs',
-            });
-        } catch (e) {
-            // fail-safe: si el chequeo de licencia explota, NO cortamos la
-            // operación (la auth HMAC ya pasó). Logueamos y seguimos.
-            console.warn('[license] checkLicenseWithGrace error (allow):', e.message);
-            licJob = { decision: 'allow' };
-        }
-        if (licJob.decision === 'deny') {
-            return res.status(403).json(GENERIC_LICENSE_ERROR);
-        }
-
+        // Enforcement de licencia (Fase 6): lo aplica authAccount (CON gracia)
+        // a TODOS los endpoints account-authed — espejo de connect-ml. Acá ya
+        // llegamos autorizados.
         const body = req.body || {};
         const type = String(body.type || '');
         if (!VALID_JOB_TYPES.has(type)) {

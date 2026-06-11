@@ -298,14 +298,15 @@ async function processSyncJob(job) {
     const account = accR.rows[0];
     if (account.revoked_at) throw new Error('cuenta revocada');
 
-    // Gate de licencia (Fase 6). Solo bloquea con LICENSE_ENFORCE=enforce y la
-    // gracia vencida; off/observe siempre pasan (observe loguea).
+    // Gate de licencia (Fase 6) — por accounts.license_exp + denylist, como
+    // connect-ml. Solo bloquea con LICENSE_ENFORCE=enforce y licencia vencida/
+    // revocada fuera de gracia; off/observe y license_exp NULL siempre pasan.
     const gate = workerLicenseGate(account);
     if (!gate.allow) {
         throw new Error(`license_invalid (${gate.reason})`);
     }
-    if (gate.reason !== 'off' && gate.reason !== 'within_grace' && gate.reason !== 'no_watermark') {
-        console.warn(`[worker] license gate sync job ${job.public_id} acc=${account.id}: ${gate.reason}`);
+    if (gate.reason === 'within_grace') {
+        console.warn(`[worker] license gate sync job ${job.public_id} acc=${account.id}: licencia vencida pero DENTRO de gracia — permitido`);
     }
 
     const token = await getValidAccessToken(account);
@@ -402,14 +403,14 @@ async function processPushJob(job) {
     const account = accR.rows[0];
     if (account.revoked_at) throw new Error('cuenta revocada');
 
-    // Gate de licencia (Fase 6). Igual que el sync: solo corta con enforce +
-    // gracia vencida.
+    // Gate de licencia (Fase 6) — igual que el sync: por license_exp + denylist
+    // (como connect-ml); solo corta con enforce + vencida/revocada fuera de gracia.
     const gate = workerLicenseGate(account);
     if (!gate.allow) {
         throw new Error(`license_invalid (${gate.reason})`);
     }
-    if (gate.reason !== 'off' && gate.reason !== 'within_grace' && gate.reason !== 'no_watermark') {
-        console.warn(`[worker] license gate push job ${job.public_id} acc=${account.id}: ${gate.reason}`);
+    if (gate.reason === 'within_grace') {
+        console.warn(`[worker] license gate push job ${job.public_id} acc=${account.id}: licencia vencida pero DENTRO de gracia — permitido`);
     }
 
     const token = await getValidAccessToken(account);

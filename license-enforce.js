@@ -27,8 +27,9 @@ export const EXPECT_PRODUCT = 'wf-tiendanube';
 // Header HTTP que trae el capability-token desde el plugin (TN).
 export const LICENSE_TOKEN_HEADER = 'x-wftn-license-token';
 
-// Ventana de gracia para /v1/jobs (sync/push). Default 72h. Solo aplica a jobs,
-// NUNCA al handshake.
+// Ventana de gracia para los endpoints account-authed (jobs/next-batch/report/
+// orders/etc — gate en authAccount, igual que connect-ml). Default 72h.
+// NUNCA aplica al handshake (entrada nueva).
 const GRACE_PERIOD_SEC = Math.max(0, Number(process.env.GRACE_PERIOD_SEC) || 259200);
 
 // Margen de reloj para exp del token.
@@ -181,33 +182,52 @@ export function isRevoked(verdict) {
 }
 
 /**
- * Gate del WORKER (sin HTTP / sin token a mano).
- *
- * Los jobs se crean por /v1/jobs, que YA pasó el gate de licencia (con gracia)
- * al momento de la creación. El worker corre después, de forma asíncrona, así
- * que NO re-verifica un token (no lo tiene): solo evita procesar trabajo de una
- * cuenta cuya gracia ya venció — el sello accounts.last_valid_license_token_at
- * es el último momento en que la cuenta presentó un token válido.
+ * Gate del WORKER (sin HTTP / sin token a mano). ESPEJO de connect-ml
+ * (licenseBlocksJob): gatea por accounts.license_exp — el vencimiento REAL del
+ * último claim válido presentado (lo sella stampValidLicense en routes-v1.js) —
+ * y NO por la edad del watermark. El worker corre después, de forma asíncrona,
+ * así que no re-verifica un token (no lo tiene): solo corta VENCIMIENTOS
+ * confirmados y revokes explícitos.
  *
  * Devuelve { allow, reason }.
- *   - off / observe → SIEMPRE allow (observe loguea desde el caller).
+ *   - off / observe → SIEMPRE allow.
  *   - enforce:
- *       sin watermark               → allow (cuenta vieja pre-fase6: no romper;
- *                                      el gate de /v1/jobs ya filtra los nuevos).
- *       dentro de gracia            → allow.
- *       fuera de gracia             → deny.
+ *       license_id en denylist      → deny 'revoked' (gana incluso sobre gracia).
+ *       sin license_exp (NULL)      → allow (fail-open: cuenta pre-Fase6 / pre-
+ *                                      migración 008; el gate de authAccount ya
+ *                                      filtra los requests en vivo).
+ *       license_exp > now           → allow (licencia vigente).
+ *       vencida + dentro de gracia  → allow (ancla = last_valid_license_token_at).
+ *       vencida + fuera de gracia   → deny 'expired'.
  *
- * @param {object} account fila accounts con last_valid_license_token_at.
+ * @param {object} account fila accounts con license_id, license_exp y
+ *                         last_valid_license_token_at.
  */
 export function workerLicenseGate(account) {
     const cfg = licenseConfig();
     if (!cfg.enforcing) return { allow: true, reason: cfg.active ? 'observe' : 'off' };
-    const lastTs = account && account.last_valid_license_token_at
+
+    // Revoke explícito gana siempre (incluso sobre gracia).
+    if (account && account.license_id && _denylist.has(String(account.license_id))) {
+        return { allow: false, reason: 'revoked' };
+    }
+
+    const expMs = account && account.license_exp ? new Date(account.license_exp).getTime() : 0;
+    // Sin license_exp conocido: nunca presentó un token válido (o pre-Fase6 /
+    // pre-migración 008). No bloqueamos por ausencia de datos — el gate del
+    // request (authAccount) ya cubre handshake/jobs en vivo; acá solo cortamos
+    // vencimientos confirmados.
+    if (!expMs) return { allow: true, reason: 'no_license_exp' };
+
+    const now = Date.now();
+    if (expMs > now) return { allow: true, reason: 'license_valid' };
+
+    // Vencida → ¿dentro de gracia? (ancla = último token válido presentado).
+    const anchorMs = account.last_valid_license_token_at
         ? new Date(account.last_valid_license_token_at).getTime()
         : 0;
-    if (lastTs <= 0) return { allow: true, reason: 'no_watermark' };
-    if (cfg.graceSec <= 0) return { allow: false, reason: 'grace_disabled_no_token' };
-    const ageSec = (Date.now() - lastTs) / 1000;
-    if (ageSec <= cfg.graceSec) return { allow: true, reason: 'within_grace' };
-    return { allow: false, reason: 'grace_expired' };
+    const inGrace = anchorMs > 0 && (now - anchorMs) <= cfg.graceSec * 1000;
+    if (inGrace) return { allow: true, reason: 'within_grace' };
+
+    return { allow: false, reason: 'expired' };
 }

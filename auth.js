@@ -32,6 +32,19 @@
  * La key vive en env var `WFTN_TOKEN_KEY` (32 bytes base64). Rotable: para rotar,
  * agregás `WFTN_TOKEN_KEY_PREV`, decrypts viejos siguen funcionando hasta que
  * todos los tokens se re-encripten con la nueva key en su próximo refresh.
+ *
+ * CIFRADO AT-REST DEL SHARED_SECRET
+ * =================================
+ *
+ * `accounts.shared_secret` también se guarda cifrado (misma key + AES-256-GCM),
+ * en la MISMA columna, distinguible por formato (ver sealSecret/openSecret):
+ *
+ *   legacy (plano):  base64 de 32 bytes — alfabeto [A-Za-z0-9+/=], sin ':'
+ *   cifrado:         "enc1:" + iv_b64 + ":" + (ciphertext‖tag)_b64
+ *
+ * Read-path backward-compat: filas legacy planas siguen funcionando tal cual.
+ * El protocolo plugin↔central NO cambia: el HMAC siempre se computa con el
+ * secret PLANO en memoria.
  */
 
 import crypto from 'node:crypto';
@@ -150,18 +163,102 @@ export function encryptToken(plaintext) {
 export function decryptToken(ciphertextB64, ivB64) {
     if (!ciphertextB64 || !ivB64) return null;
     try {
-        const key = getTokenKey();
-        const iv = Buffer.from(ivB64, 'base64');
-        const blob = Buffer.from(ciphertextB64, 'base64');
-        // Los últimos 16 bytes son el auth tag (GCM standard).
-        const tag = blob.subarray(blob.length - 16);
-        const enc = blob.subarray(0, blob.length - 16);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-        decipher.setAuthTag(tag);
-        const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
-        return dec.toString('utf8');
+        return decryptWithKey(getTokenKey(), ciphertextB64, ivB64);
     } catch (err) {
+        // Rotación de key: reintentar con WFTN_TOKEN_KEY_PREV si está definida.
+        const prev = getPrevTokenKey();
+        if (prev) {
+            try {
+                return decryptWithKey(prev, ciphertextB64, ivB64);
+            } catch (err2) {
+                console.warn('[auth] decryptToken failed (key actual y _PREV):', err2.message);
+                return null;
+            }
+        }
         console.warn('[auth] decryptToken failed:', err.message);
         return null;
     }
+}
+
+/** Decripta con una key concreta. Throw si la auth tag no valida. */
+function decryptWithKey(key, ciphertextB64, ivB64) {
+    const iv = Buffer.from(ivB64, 'base64');
+    const blob = Buffer.from(ciphertextB64, 'base64');
+    // Los últimos 16 bytes son el auth tag (GCM standard).
+    const tag = blob.subarray(blob.length - 16);
+    const enc = blob.subarray(0, blob.length - 16);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
+    return dec.toString('utf8');
+}
+
+/**
+ * Key anterior para rotación (WFTN_TOKEN_KEY_PREV). Devuelve null si no está
+ * definida o es inválida — en ese caso el fallback simplemente no se intenta.
+ */
+function getPrevTokenKey() {
+    const raw = process.env.WFTN_TOKEN_KEY_PREV;
+    if (!raw) return null;
+    const key = Buffer.from(raw, 'base64');
+    if (key.length !== 32) {
+        console.warn('[auth] WFTN_TOKEN_KEY_PREV inválida (debe ser 32 bytes base64) — ignorada');
+        return null;
+    }
+    return key;
+}
+
+// ----------------------------------------------------------------------------
+// Cifrado at-rest del shared_secret (misma key/algoritmo que los tokens)
+// ----------------------------------------------------------------------------
+//
+// Formato en DB (misma columna accounts.shared_secret):
+//
+//   "enc1:" + iv_b64 + ":" + (ciphertext‖tag)_b64
+//
+// Inequívoco vs. legacy: el valor plano es base64 estándar (alfabeto
+// [A-Za-z0-9+/=]) que NUNCA contiene ':'. El prefijo "enc1:" además versiona
+// el formato. NO se loguea jamás el secreto (ni plano ni cifrado).
+
+const SECRET_ENC_PREFIX = 'enc1:';
+
+/** ¿El valor guardado en DB está en formato cifrado (enc1)? */
+export function isSealedSecret(stored) {
+    return typeof stored === 'string' && stored.startsWith(SECRET_ENC_PREFIX);
+}
+
+/**
+ * Cifra un shared_secret para persistirlo. Devuelve "enc1:<iv>:<ct+tag>".
+ * THROW si la key de cifrado falta/es inválida (mismo contrato que
+ * encryptToken): el write-path debe fallar explícito, nunca guardar plano
+ * por accidente ni un valor a medias.
+ */
+export function sealSecret(plainSecret) {
+    if (typeof plainSecret !== 'string' || plainSecret === '') {
+        throw new Error('sealSecret: secret vacío');
+    }
+    const { ciphertext, iv } = encryptToken(plainSecret);
+    return `${SECRET_ENC_PREFIX}${iv}:${ciphertext}`;
+}
+
+/**
+ * Devuelve el shared_secret PLANO a partir de lo que haya en la DB:
+ *
+ *   - formato enc1       → decrypt; null si la key no valida (key rotada sin
+ *                          migrar / fila corrupta) → el caller rechaza la auth
+ *                          de ESA cuenta, sin crash del proceso.
+ *   - cualquier otro     → fila legacy en texto plano: se usa tal cual.
+ *
+ * NUNCA throw y NUNCA loguea el secreto.
+ */
+export function openSecret(stored) {
+    if (typeof stored !== 'string' || stored === '') return null;
+    if (!isSealedSecret(stored)) return stored; // fila legacy plana
+    const rest = stored.slice(SECRET_ENC_PREFIX.length);
+    const sep = rest.indexOf(':');
+    if (sep <= 0 || sep === rest.length - 1) return null; // formato corrupto
+    const iv = rest.slice(0, sep);
+    const ciphertext = rest.slice(sep + 1);
+    // decryptToken ya es no-throw y loguea solo err.message (sin secreto).
+    return decryptToken(ciphertext, iv);
 }
