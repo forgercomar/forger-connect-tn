@@ -160,6 +160,9 @@ const TN_USER_AGENT    = process.env.TN_USER_AGENT || 'Forger (info@forger.com.a
 const BASE_URL         = (process.env.BASE_URL || 'https://forger.com.ar').replace(/\/$/, '');
 // Redirect URI registrado en el panel de partners de TiendaNube (app 32980).
 const CALLBACK_URL     = `${BASE_URL}/connect-tn/oauth/callback`;
+// El logo de Forger de la pantalla de confirmación (copia de Proyecto Color, 24-11-2026; ver
+// VERSIONES.md). Sin la variable, el de siempre.
+const MARCA_URL        = process.env.WFTN_MARCA_URL || 'https://forger.com.ar/forger-logo.png';
 
 // Validar config al arrancar — fail-fast.
 const missing = [];
@@ -551,7 +554,7 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl, alreadyConnected 
             </div>
             <div class="center">
                 <div class="halo" aria-hidden="true"></div>
-                <div class="ring is-center"><img src="https://forger.com.ar/forger-logo.png" alt="Forger" onerror="this.style.display='none'" /></div>
+                <div class="ring is-center"><img src="${escapeHtml(MARCA_URL)}" alt="Forger" onerror="this.style.display='none'" /></div>
                 <span class="label is-center"><strong>Forger</strong><br><span>Capa de integración</span></span>
             </div>
             <div class="connector" aria-hidden="true">
